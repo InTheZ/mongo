@@ -1,12 +1,13 @@
 package mongo
 
 import (
+	"context"
 	"encoding/json"
+	"github.com/mongodb/mongo-go-driver/bson/objectid"
 	"time"
 
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
-	"github.com/globalsign/mgo/txn"
+	"github.com/mongodb/mongo-go-driver/bson"
+	"github.com/mongodb/mongo-go-driver/mongo"
 	"gopkg.in/oauth2.v3"
 	"gopkg.in/oauth2.v3/models"
 )
@@ -49,39 +50,69 @@ func NewDefaultTokenConfig() *TokenConfig {
 
 // NewTokenStore create a token store instance based on mongodb
 func NewTokenStore(cfg *Config, tcfgs ...*TokenConfig) (store *TokenStore) {
-	session, err := mgo.Dial(cfg.URL)
+	client, err := mongo.NewClient(cfg.URL)
 	if err != nil {
 		panic(err)
 	}
 
-	return NewTokenStoreWithSession(session, cfg.DB, tcfgs...)
+	return NewTokenStoreWithSession(client, cfg.DB, tcfgs...)
 }
 
 // NewTokenStoreWithSession create a token store instance based on mongodb
-func NewTokenStoreWithSession(session *mgo.Session, dbName string, tcfgs ...*TokenConfig) (store *TokenStore) {
+func NewTokenStoreWithSession(client *mongo.Client, dbName string, tcfgs ...*TokenConfig) (store *TokenStore) {
 	ts := &TokenStore{
-		dbName:  dbName,
-		session: session,
-		tcfg:    NewDefaultTokenConfig(),
+		dbName: dbName,
+		client: client,
+		tcfg:   NewDefaultTokenConfig(),
 	}
 	if len(tcfgs) > 0 {
 		ts.tcfg = tcfgs[0]
 	}
 
-	ts.c(ts.tcfg.BasicCName).EnsureIndex(mgo.Index{
-		Key:         []string{"ExpiredAt"},
-		ExpireAfter: time.Second * 1,
-	})
+	indexViewBasicCName := client.Database(dbName).Collection(ts.tcfg.BasicCName).Indexes()
 
-	ts.c(ts.tcfg.AccessCName).EnsureIndex(mgo.Index{
-		Key:         []string{"ExpiredAt"},
-		ExpireAfter: time.Second * 1,
-	})
+	_, _ = indexViewBasicCName.CreateOne(
+		context.Background(),
+		mongo.IndexModel{
+			Keys: bson.NewDocument(
+				bson.EC.Int32("ExpiredAt", 1),
+			),
+			Options: mongo.NewIndexOptionsBuilder().
+				ExpireAfterSeconds(1).
+				Name("basicCNameIndex").
+				Build(),
+		},
+	)
 
-	ts.c(ts.tcfg.RefreshCName).EnsureIndex(mgo.Index{
-		Key:         []string{"ExpiredAt"},
-		ExpireAfter: time.Second * 1,
-	})
+	indexViewAccessCName := client.Database(dbName).Collection(ts.tcfg.AccessCName).Indexes()
+
+	_, _ = indexViewAccessCName.CreateOne(
+		context.Background(),
+		mongo.IndexModel{
+			Keys: bson.NewDocument(
+				bson.EC.Int32("ExpiredAt", 1),
+			),
+			Options: mongo.NewIndexOptionsBuilder().
+				ExpireAfterSeconds(1).
+				Name("accessCNameIndex").
+				Build(),
+		},
+	)
+
+	indexViewRefreshCName := client.Database(dbName).Collection(ts.tcfg.RefreshCName).Indexes()
+
+	_, _ = indexViewRefreshCName.CreateOne(
+		context.Background(),
+		mongo.IndexModel{
+			Keys: bson.NewDocument(
+				bson.EC.Int32("ExpiredAt", 1),
+			),
+			Options: mongo.NewIndexOptionsBuilder().
+				ExpireAfterSeconds(1).
+				Name("refreshCNameIndex").
+				Build(),
+		},
+	)
 
 	store = ts
 	return
@@ -89,24 +120,22 @@ func NewTokenStoreWithSession(session *mgo.Session, dbName string, tcfgs ...*Tok
 
 // TokenStore MongoDB storage for OAuth 2.0
 type TokenStore struct {
-	tcfg    *TokenConfig
-	dbName  string
-	session *mgo.Session
+	tcfg   *TokenConfig
+	dbName string
+	client *mongo.Client
 }
 
 // Close close the mongo session
 func (ts *TokenStore) Close() {
-	ts.session.Close()
+	ts.client.Disconnect(context.Background())
 }
 
-func (ts *TokenStore) c(name string) *mgo.Collection {
-	return ts.session.DB(ts.dbName).C(name)
+func (ts *TokenStore) c(name string) *mongo.Collection {
+	return ts.client.Database(ts.dbName).Collection(name)
 }
 
-func (ts *TokenStore) cHandler(name string, handler func(c *mgo.Collection)) {
-	session := ts.session.Clone()
-	defer session.Close()
-	handler(session.DB(ts.dbName).C(name))
+func (ts *TokenStore) cHandler(name string, handler func(c *mongo.Collection)) {
+	handler(ts.client.Database(ts.dbName).Collection(name))
 	return
 }
 
@@ -118,14 +147,21 @@ func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 	}
 
 	if code := info.GetCode(); code != "" {
-		ts.cHandler(ts.tcfg.BasicCName, func(c *mgo.Collection) {
-			err = c.Insert(basicData{
-				ID:        code,
-				Data:      jv,
-				ExpiredAt: info.GetCodeCreateAt().Add(info.GetCodeExpiresIn()),
-			})
+		ts.cHandler(ts.tcfg.BasicCName, func(c *mongo.Collection) {
+			_, verr := c.InsertOne(context.Background(),
+				bson.NewDocument(
+					bson.EC.String("_id", code),
+					bson.EC.String("Data", string(jv[:])),
+					bson.EC.DateTime("ExpiredAt", info.GetCodeCreateAt().Add(info.GetCodeExpiresIn()).
+						UnixNano()/int64(time.Millisecond)),
+				),
+			)
+			if verr != nil {
+				err = verr
+				return
+			}
+			return
 		})
-		return
 	}
 
 	aexp := info.GetAccessCreateAt().Add(info.GetAccessExpiresIn())
@@ -136,51 +172,46 @@ func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 			aexp = rexp
 		}
 	}
-	id := bson.NewObjectId().Hex()
-	ops := []txn.Op{{
-		C:      ts.tcfg.BasicCName,
-		Id:     id,
-		Assert: txn.DocMissing,
-		Insert: basicData{
-			Data:      jv,
-			ExpiredAt: rexp,
-		},
-	}, {
-		C:      ts.tcfg.AccessCName,
-		Id:     info.GetAccess(),
-		Assert: txn.DocMissing,
-		Insert: tokenData{
-			BasicID:   id,
-			ExpiredAt: aexp,
-		},
-	}}
-	if refresh := info.GetRefresh(); refresh != "" {
-		ops = append(ops, txn.Op{
-			C:      ts.tcfg.RefreshCName,
-			Id:     refresh,
-			Assert: txn.DocMissing,
-			Insert: tokenData{
-				BasicID:   id,
-				ExpiredAt: rexp,
-			},
-		})
+	id := objectid.New()
+
+	docs := []interface{}{
+		bson.NewDocument(
+			bson.EC.ObjectID("_id", id),
+			bson.EC.String("Data", string(jv[:])),
+			bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
+		),
+		bson.NewDocument(
+			bson.EC.String("_id", info.GetAccess()),
+			bson.EC.ObjectID("BasicID", id),
+			bson.EC.DateTime("ExpiredAt", aexp.UnixNano()/int64(time.Millisecond)),
+		),
 	}
-	ts.cHandler(ts.tcfg.TxnCName, func(c *mgo.Collection) {
-		runner := txn.NewRunner(c)
-		err = runner.Run(ops, "", nil)
+
+	if refresh := info.GetRefresh(); refresh != "" {
+		docs = append(docs,
+			bson.NewDocument(
+				bson.EC.String("_id", refresh),
+				bson.EC.ObjectID("BasicID", id),
+				bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
+			),
+		)
+	}
+	ts.cHandler(ts.tcfg.TxnCName, func(c *mongo.Collection) {
+		_, _ = c.InsertMany(context.Background(), docs)
 	})
 	return
 }
 
 // RemoveByCode use the authorization code to delete the token information
 func (ts *TokenStore) RemoveByCode(code string) (err error) {
-	ts.cHandler(ts.tcfg.BasicCName, func(c *mgo.Collection) {
-		verr := c.RemoveId(code)
+	ts.cHandler(ts.tcfg.BasicCName, func(c *mongo.Collection) {
+		_, verr := c.DeleteMany(context.Background(),
+			bson.NewDocument(
+				bson.EC.String("_id", code),
+			))
 		if verr != nil {
-			if verr == mgo.ErrNotFound {
-				return
-			}
 			err = verr
+			return
 		}
 	})
 	return
@@ -188,13 +219,14 @@ func (ts *TokenStore) RemoveByCode(code string) (err error) {
 
 // RemoveByAccess use the access token to delete the token information
 func (ts *TokenStore) RemoveByAccess(access string) (err error) {
-	ts.cHandler(ts.tcfg.AccessCName, func(c *mgo.Collection) {
-		verr := c.RemoveId(access)
+	ts.cHandler(ts.tcfg.AccessCName, func(c *mongo.Collection) {
+		_, verr := c.DeleteMany(context.Background(),
+			bson.NewDocument(
+				bson.EC.String("_id", access),
+			))
 		if verr != nil {
-			if verr == mgo.ErrNotFound {
-				return
-			}
 			err = verr
+			return
 		}
 	})
 	return
@@ -202,24 +234,28 @@ func (ts *TokenStore) RemoveByAccess(access string) (err error) {
 
 // RemoveByRefresh use the refresh token to delete the token information
 func (ts *TokenStore) RemoveByRefresh(refresh string) (err error) {
-	ts.cHandler(ts.tcfg.RefreshCName, func(c *mgo.Collection) {
-		verr := c.RemoveId(refresh)
+	ts.cHandler(ts.tcfg.RefreshCName, func(c *mongo.Collection) {
+		_, verr := c.DeleteMany(context.Background(),
+			bson.NewDocument(
+				bson.EC.String("_id", refresh),
+			))
 		if verr != nil {
-			if verr == mgo.ErrNotFound {
-				return
-			}
 			err = verr
+			return
 		}
 	})
 	return
 }
 
 func (ts *TokenStore) getData(basicID string) (ti oauth2.TokenInfo, err error) {
-	ts.cHandler(ts.tcfg.BasicCName, func(c *mgo.Collection) {
+	ts.cHandler(ts.tcfg.BasicCName, func(c *mongo.Collection) {
 		var bd basicData
-		verr := c.FindId(basicID).One(&bd)
+		verr := c.FindOne(context.Background(),
+			bson.NewDocument(
+				bson.EC.String("_id", basicID),
+			)).Decode(&bd)
 		if verr != nil {
-			if verr == mgo.ErrNotFound {
+			if verr == mongo.ErrNoDocuments {
 				return
 			}
 			err = verr
@@ -236,11 +272,14 @@ func (ts *TokenStore) getData(basicID string) (ti oauth2.TokenInfo, err error) {
 }
 
 func (ts *TokenStore) getBasicID(cname, token string) (basicID string, err error) {
-	ts.cHandler(cname, func(c *mgo.Collection) {
+	ts.cHandler(cname, func(c *mongo.Collection) {
 		var td tokenData
-		verr := c.FindId(token).One(&td)
+		verr := c.FindOne(context.Background(),
+			bson.NewDocument(
+				bson.EC.String("_id", token),
+			)).Decode(&td)
 		if verr != nil {
-			if verr == mgo.ErrNotFound {
+			if verr == mongo.ErrNoDocuments {
 				return
 			}
 			err = verr
