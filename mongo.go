@@ -60,6 +60,15 @@ func NewTokenStore(cfg *Config, tcfgs ...*TokenConfig) (store *TokenStore) {
 	return NewTokenStoreWithSession(client, cfg.DB, tcfgs...)
 }
 
+// CreateIndex create a new index based on an IndexModel
+func CreateIndex(client *mongo.Client, dbName string, collectionName string, index *mongo.IndexModel) {
+	indexView := client.Database(dbName).Collection(collectionName).Indexes()
+	_, err := indexView.CreateOne(context.Background(), *index)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 // NewTokenStoreWithSession create a token store instance based on mongodb
 func NewTokenStoreWithSession(client *mongo.Client, dbName string, tcfgs ...*TokenConfig) (store *TokenStore) {
 	ts := &TokenStore{
@@ -71,59 +80,35 @@ func NewTokenStoreWithSession(client *mongo.Client, dbName string, tcfgs ...*Tok
 		ts.tcfg = tcfgs[0]
 	}
 
-	indexViewBasicCName := client.Database(dbName).Collection(ts.tcfg.BasicCName).Indexes()
+	CreateIndex(client, dbName, ts.tcfg.BasicCName, &mongo.IndexModel{
+		Keys: bson.NewDocument(
+			bson.EC.Int32("ExpiredAt", 1),
+		),
+		Options: mongo.NewIndexOptionsBuilder().
+			ExpireAfterSeconds(1).
+			Name("basicCNameIndex").
+			Build(),
+	})
 
-	_, err := indexViewBasicCName.CreateOne(
-		context.Background(),
-		mongo.IndexModel{
-			Keys: bson.NewDocument(
-				bson.EC.Int32("ExpiredAt", 1),
-			),
-			Options: mongo.NewIndexOptionsBuilder().
-				ExpireAfterSeconds(1).
-				Name("basicCNameIndex").
-				Build(),
-		},
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
+	CreateIndex(client, dbName, ts.tcfg.AccessCName, &mongo.IndexModel{
+		Keys: bson.NewDocument(
+			bson.EC.Int32("ExpiredAt", 1),
+		),
+		Options: mongo.NewIndexOptionsBuilder().
+			ExpireAfterSeconds(1).
+			Name("accessCNameIndex").
+			Build(),
+	})
 
-	indexViewAccessCName := client.Database(dbName).Collection(ts.tcfg.AccessCName).Indexes()
-
-	_, err = indexViewAccessCName.CreateOne(
-		context.Background(),
-		mongo.IndexModel{
-			Keys: bson.NewDocument(
-				bson.EC.Int32("ExpiredAt", 1),
-			),
-			Options: mongo.NewIndexOptionsBuilder().
-				ExpireAfterSeconds(1).
-				Name("accessCNameIndex").
-				Build(),
-		},
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	indexViewRefreshCName := client.Database(dbName).Collection(ts.tcfg.RefreshCName).Indexes()
-
-	_, err = indexViewRefreshCName.CreateOne(
-		context.Background(),
-		mongo.IndexModel{
-			Keys: bson.NewDocument(
-				bson.EC.Int32("ExpiredAt", 1),
-			),
-			Options: mongo.NewIndexOptionsBuilder().
-				ExpireAfterSeconds(1).
-				Name("refreshCNameIndex").
-				Build(),
-		},
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
+	CreateIndex(client, dbName, ts.tcfg.RefreshCName, &mongo.IndexModel{
+		Keys: bson.NewDocument(
+			bson.EC.Int32("ExpiredAt", 1),
+		),
+		Options: mongo.NewIndexOptionsBuilder().
+			ExpireAfterSeconds(1).
+			Name("refreshCNameIndex").
+			Build(),
+	})
 
 	store = ts
 	return
@@ -150,6 +135,16 @@ func (ts *TokenStore) cHandler(name string, handler func(c *mongo.Collection)) {
 	return
 }
 
+// InsertOne inserts a document into the database
+func InsertOne(ts *TokenStore, collectionName string, doc *bson.Document) (err error) {
+	_, verr := ts.client.Database(ts.dbName).Collection(collectionName).InsertOne(context.Background(), doc)
+	if verr != nil {
+		err = verr
+		return
+	}
+	return
+}
+
 // Create create and store the new token information
 func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 	jv, err := json.Marshal(info)
@@ -158,21 +153,13 @@ func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 	}
 
 	if code := info.GetCode(); code != "" {
-		ts.cHandler(ts.tcfg.BasicCName, func(c *mongo.Collection) {
-			_, verr := c.InsertOne(context.Background(),
-				bson.NewDocument(
-					bson.EC.String("_id", code),
-					bson.EC.String("Data", string(jv[:])),
-					bson.EC.DateTime("ExpiredAt", info.GetCodeCreateAt().Add(info.GetCodeExpiresIn()).
-						UnixNano()/int64(time.Millisecond)),
-				),
-			)
-			if verr != nil {
-				err = verr
-				return
-			}
-			return
-		})
+		InsertOne(ts, ts.tcfg.BasicCName,
+			bson.NewDocument(
+				bson.EC.String("_id", code),
+				bson.EC.String("Data", string(jv[:])),
+				bson.EC.DateTime("ExpiredAt", info.GetCodeCreateAt().Add(info.GetCodeExpiresIn()).
+					UnixNano()/int64(time.Millisecond)),
+			))
 	}
 
 	aexp := info.GetAccessCreateAt().Add(info.GetAccessExpiresIn())
@@ -183,142 +170,114 @@ func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 			aexp = rexp
 		}
 	}
-	id := objectid.New()
+	id := objectid.New().Hex()
 
-	ts.cHandler(ts.tcfg.BasicCName, func(c *mongo.Collection) {
-		_, verr := c.InsertOne(context.Background(),
-			bson.NewDocument(
-				bson.EC.ObjectID("_id", id),
-				bson.EC.String("Data", string(jv[:])),
-				bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
-			),
-		)
-		if verr != nil {
-			err = verr
-			return
-		}
-		return
-	})
+	InsertOne(ts, ts.tcfg.BasicCName,
+		bson.NewDocument(
+			bson.EC.String("_id", id),
+			bson.EC.String("Data", string(jv[:])),
+			bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
+		))
 
-	ts.cHandler(ts.tcfg.AccessCName, func(c *mongo.Collection) {
-		_, verr := c.InsertOne(context.Background(),
+	if info.GetAccess() != "" {
+		InsertOne(ts, ts.tcfg.AccessCName,
 			bson.NewDocument(
 				bson.EC.String("_id", info.GetAccess()),
-				bson.EC.ObjectID("BasicID", id),
+				bson.EC.String("BasicID", id),
 				bson.EC.DateTime("ExpiredAt", aexp.UnixNano()/int64(time.Millisecond)),
-			),
-		)
-		if verr != nil {
-			err = verr
-			return
-		}
-		return
-	})
+			))
+	}
 
 	if refresh := info.GetRefresh(); refresh != "" {
-		ts.cHandler(ts.tcfg.AccessCName, func(c *mongo.Collection) {
-			_, verr := c.InsertOne(context.Background(),
-				bson.NewDocument(
-					bson.EC.String("_id", refresh),
-					bson.EC.ObjectID("BasicID", id),
-					bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
-				),
-			)
-			if verr != nil {
-				err = verr
-				return
-			}
-			return
-		})
+		InsertOne(ts, ts.tcfg.RefreshCName,
+			bson.NewDocument(
+				bson.EC.String("_id", refresh),
+				bson.EC.String("BasicID", id),
+				bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
+			))
+	}
+	return
+}
+
+// DeleteByID deletes a document by the _id value
+func DeleteByID(ts *TokenStore, collectionName string, id string) (err error) {
+	_, verr := ts.client.Database(ts.dbName).Collection(collectionName).DeleteOne(context.Background(),
+		bson.NewDocument(
+			bson.EC.String("_id", id),
+		))
+	if verr != nil {
+		err = verr
+		return
 	}
 	return
 }
 
 // RemoveByCode use the authorization code to delete the token information
 func (ts *TokenStore) RemoveByCode(code string) (err error) {
-	ts.cHandler(ts.tcfg.BasicCName, func(c *mongo.Collection) {
-		_, verr := c.DeleteMany(context.Background(),
-			bson.NewDocument(
-				bson.EC.String("_id", code),
-			))
-		if verr != nil {
-			err = verr
-			return
-		}
-	})
+	verr := DeleteByID(ts, ts.tcfg.BasicCName, code)
+	if verr != nil {
+		err = verr
+		return
+	}
 	return
 }
 
 // RemoveByAccess use the access token to delete the token information
 func (ts *TokenStore) RemoveByAccess(access string) (err error) {
-	ts.cHandler(ts.tcfg.AccessCName, func(c *mongo.Collection) {
-		_, verr := c.DeleteMany(context.Background(),
-			bson.NewDocument(
-				bson.EC.String("_id", access),
-			))
-		if verr != nil {
-			err = verr
-			return
-		}
-	})
+	verr := DeleteByID(ts, ts.tcfg.AccessCName, access)
+	if verr != nil {
+		err = verr
+		return
+	}
 	return
 }
 
 // RemoveByRefresh use the refresh token to delete the token information
 func (ts *TokenStore) RemoveByRefresh(refresh string) (err error) {
-	ts.cHandler(ts.tcfg.RefreshCName, func(c *mongo.Collection) {
-		_, verr := c.DeleteMany(context.Background(),
-			bson.NewDocument(
-				bson.EC.String("_id", refresh),
-			))
-		if verr != nil {
-			err = verr
-			return
-		}
-	})
+	verr := DeleteByID(ts, ts.tcfg.RefreshCName, refresh)
+	if verr != nil {
+		err = verr
+		return
+	}
+	return
+}
+
+// FindByID returns a DocumentResult for a given ID
+func FindByID(ts *TokenStore, collectionName string, id string) (doc *mongo.DocumentResult) {
+	doc = ts.client.Database(ts.dbName).Collection(collectionName).FindOne(context.Background(), bson.NewDocument(bson.EC.String("_id", id)))
 	return
 }
 
 func (ts *TokenStore) getData(basicID string) (ti oauth2.TokenInfo, err error) {
-	ts.cHandler(ts.tcfg.BasicCName, func(c *mongo.Collection) {
-		var bd basicData
-		verr := c.FindOne(context.Background(),
-			bson.NewDocument(
-				bson.EC.String("_id", basicID),
-			)).Decode(&bd)
-		if verr != nil {
-			if verr == mongo.ErrNoDocuments {
-				return
-			}
-			err = verr
+	var bd basicData
+	verr := FindByID(ts, ts.tcfg.BasicCName, basicID).Decode(&bd)
+	if verr != nil {
+		if verr == mongo.ErrNoDocuments {
 			return
 		}
-		var tm models.Token
-		err = json.Unmarshal(bd.Data, &tm)
-		if err != nil {
-			return
-		}
-		ti = &tm
-	})
+		err = verr
+		return
+	}
+	var tm models.Token
+	err = json.Unmarshal([]byte(bd.Data), &tm)
+	if err != nil {
+		return
+	}
+	ti = &tm
 	return
 }
 
 func (ts *TokenStore) getBasicID(cname, token string) (basicID string, err error) {
-	ts.cHandler(cname, func(c *mongo.Collection) {
-		var td tokenData
-		verr := c.FindOne(context.Background(),
-			bson.NewDocument(
-				bson.EC.String("_id", token),
-			)).Decode(&td)
-		if verr != nil {
-			if verr == mongo.ErrNoDocuments {
-				return
-			}
-			err = verr
+	var td tokenData
+	verr := FindByID(ts, cname, token).Decode(&td)
+	if verr != nil {
+		if verr == mongo.ErrNoDocuments {
 			return
 		}
-		basicID = td.BasicID
-	})
+		err = verr
+		return
+	}
+	basicID = td.BasicID
 	return
 }
 
@@ -350,7 +309,7 @@ func (ts *TokenStore) GetByRefresh(refresh string) (ti oauth2.TokenInfo, err err
 
 type basicData struct {
 	ID        string    `bson:"_id"`
-	Data      []byte    `bson:"Data"`
+	Data      string    `bson:"Data"`
 	ExpiredAt time.Time `bson:"ExpiredAt"`
 }
 
