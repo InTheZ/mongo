@@ -1,16 +1,17 @@
-package mongo
+package oauth2mongo
 
 import (
 	"context"
 	"encoding/json"
 	"github.com/mongodb/mongo-go-driver/bson/objectid"
-	"log"
 	"time"
 
 	"github.com/mongodb/mongo-go-driver/bson"
 	"github.com/mongodb/mongo-go-driver/mongo"
+	"github.com/mongodb/mongo-go-driver/x/bsonx"
 	"gopkg.in/oauth2.v3"
 	"gopkg.in/oauth2.v3/models"
+	"log"
 )
 
 // Config mongodb configuration parameters
@@ -81,9 +82,7 @@ func NewTokenStoreWithSession(client *mongo.Client, dbName string, tcfgs ...*Tok
 	}
 
 	CreateIndex(client, dbName, ts.tcfg.BasicCName, &mongo.IndexModel{
-		Keys: bson.NewDocument(
-			bson.EC.Int32("ExpiredAt", 1),
-		),
+		Keys: bsonx.Doc{{"ExpiredAt", bsonx.Int32(1)}},
 		Options: mongo.NewIndexOptionsBuilder().
 			ExpireAfterSeconds(1).
 			Name("basicCNameIndex").
@@ -91,9 +90,7 @@ func NewTokenStoreWithSession(client *mongo.Client, dbName string, tcfgs ...*Tok
 	})
 
 	CreateIndex(client, dbName, ts.tcfg.AccessCName, &mongo.IndexModel{
-		Keys: bson.NewDocument(
-			bson.EC.Int32("ExpiredAt", 1),
-		),
+		Keys: bsonx.Doc{{"ExpiredAt", bsonx.Int32(1)}},
 		Options: mongo.NewIndexOptionsBuilder().
 			ExpireAfterSeconds(1).
 			Name("accessCNameIndex").
@@ -101,9 +98,7 @@ func NewTokenStoreWithSession(client *mongo.Client, dbName string, tcfgs ...*Tok
 	})
 
 	CreateIndex(client, dbName, ts.tcfg.RefreshCName, &mongo.IndexModel{
-		Keys: bson.NewDocument(
-			bson.EC.Int32("ExpiredAt", 1),
-		),
+		Keys: bsonx.Doc{{"ExpiredAt", bsonx.Int32(1)}},
 		Options: mongo.NewIndexOptionsBuilder().
 			ExpireAfterSeconds(1).
 			Name("refreshCNameIndex").
@@ -136,9 +131,10 @@ func (ts *TokenStore) cHandler(name string, handler func(c *mongo.Collection)) {
 }
 
 // InsertOne inserts a document into the database
-func InsertOne(ts *TokenStore, collectionName string, doc *bson.Document) (err error) {
+func InsertOne(ts *TokenStore, collectionName string, doc *bson.D) (err error) {
 	_, verr := ts.client.Database(ts.dbName).Collection(collectionName).InsertOne(context.Background(), doc)
 	if verr != nil {
+		log.Fatal(verr)
 		err = verr
 		return
 	}
@@ -154,12 +150,12 @@ func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 
 	if code := info.GetCode(); code != "" {
 		InsertOne(ts, ts.tcfg.BasicCName,
-			bson.NewDocument(
-				bson.EC.String("_id", code),
-				bson.EC.String("Data", string(jv[:])),
-				bson.EC.DateTime("ExpiredAt", info.GetCodeCreateAt().Add(info.GetCodeExpiresIn()).
-					UnixNano()/int64(time.Millisecond)),
-			))
+			&bson.D{
+				{"_id", code},
+				{"Data", string(jv[:])},
+				{"ExpiredAt", time.Unix(0, info.GetCodeCreateAt().Add(info.GetCodeExpiresIn()).
+					UnixNano()/int64(time.Millisecond))},
+			})
 	}
 
 	aexp := info.GetAccessCreateAt().Add(info.GetAccessExpiresIn())
@@ -173,28 +169,28 @@ func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 	id := objectid.New().Hex()
 
 	InsertOne(ts, ts.tcfg.BasicCName,
-		bson.NewDocument(
-			bson.EC.String("_id", id),
-			bson.EC.String("Data", string(jv[:])),
-			bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
-		))
+		&bson.D{
+			{"_id", id},
+			{"Data", string(jv[:])},
+			{"ExpiredAt", time.Unix(0, rexp.UnixNano()/int64(time.Millisecond))},
+		})
 
 	if info.GetAccess() != "" {
 		InsertOne(ts, ts.tcfg.AccessCName,
-			bson.NewDocument(
-				bson.EC.String("_id", info.GetAccess()),
-				bson.EC.String("BasicID", id),
-				bson.EC.DateTime("ExpiredAt", aexp.UnixNano()/int64(time.Millisecond)),
-			))
+			&bson.D{
+				{"_id", info.GetAccess()},
+				{"BasicID", id},
+				{"ExpiredAt", time.Unix(0, aexp.UnixNano()/int64(time.Millisecond))},
+			})
 	}
 
 	if refresh := info.GetRefresh(); refresh != "" {
 		InsertOne(ts, ts.tcfg.RefreshCName,
-			bson.NewDocument(
-				bson.EC.String("_id", refresh),
-				bson.EC.String("BasicID", id),
-				bson.EC.DateTime("ExpiredAt", rexp.UnixNano()/int64(time.Millisecond)),
-			))
+			&bson.D{
+				{"_id", refresh},
+				{"BasicID", id},
+				{"ExpiredAt", time.Unix(0, rexp.UnixNano()/int64(time.Millisecond))},
+			})
 	}
 	return
 }
@@ -202,9 +198,9 @@ func (ts *TokenStore) Create(info oauth2.TokenInfo) (err error) {
 // DeleteByID deletes a document by the _id value
 func DeleteByID(ts *TokenStore, collectionName string, id string) (err error) {
 	_, verr := ts.client.Database(ts.dbName).Collection(collectionName).DeleteOne(context.Background(),
-		bson.NewDocument(
-			bson.EC.String("_id", id),
-		))
+		bson.M{
+			"_id": id,
+		})
 	if verr != nil {
 		err = verr
 		return
@@ -244,7 +240,7 @@ func (ts *TokenStore) RemoveByRefresh(refresh string) (err error) {
 
 // FindByID returns a DocumentResult for a given ID
 func FindByID(ts *TokenStore, collectionName string, id string) (doc *mongo.DocumentResult) {
-	doc = ts.client.Database(ts.dbName).Collection(collectionName).FindOne(context.Background(), bson.NewDocument(bson.EC.String("_id", id)))
+	doc = ts.client.Database(ts.dbName).Collection(collectionName).FindOne(context.Background(), bson.M{"_id": id})
 	return
 }
 
@@ -255,6 +251,7 @@ func (ts *TokenStore) getData(basicID string) (ti oauth2.TokenInfo, err error) {
 		if verr == mongo.ErrNoDocuments {
 			return
 		}
+		log.Fatal(verr)
 		err = verr
 		return
 	}
